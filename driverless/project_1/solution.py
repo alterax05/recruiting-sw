@@ -1,7 +1,10 @@
 import cv2
 import sys
-import numpy as np
+import numpy as np 
 from collections import Counter
+from skimage import exposure
+import splines
+from typing import Tuple
 
 def detect_tearing(image: np.ndarray) -> int:
     """
@@ -28,7 +31,7 @@ def detect_tearing(image: np.ndarray) -> int:
             return most_common_line_y
     return None
 
-def split_image(image: np.ndarray, line):
+def split_image_and_reverse(image: np.ndarray, line):
     """
     Split the image into two parts along the detected tear (horizontal line).
     """
@@ -38,7 +41,7 @@ def split_image(image: np.ndarray, line):
         return bottom_half, top_half
     return None, None
 
-def apply_color_correction(image, true_color, reference_point):
+def apply_color_correction(image: np.ndarray, true_color: tuple, reference_point: tuple):
     y, x, _ = image.shape
 
     aberrant_color = image[int(reference_point[1]%y), int(reference_point[0]%x)].astype(float)
@@ -58,6 +61,39 @@ def apply_color_correction(image, true_color, reference_point):
     print("Colore corretto:", corrected_image[int(reference_point[1]%y), int(reference_point[0]%x)], end="\n\n")
     return corrected_image.astype(np.uint8)
 
+def normalize_image(image: np.ndarray, max_val: int, min_val: int) -> np.ndarray:
+    p_min = np.min(image)
+    p_max = np.max(image)
+    normalized_image = (image - p_min) / (p_max - p_min) * (max_val-min_val) + min_val
+    return normalized_image.astype(np.uint8)
+
+def apply_color_correction_v2(image: np.array, points: Tuple[Tuple[int, int]], true_colors: Tuple[Tuple[int, int, int]]) -> np.array:
+    #getting colors from image
+    colors = [image[point[1]][point[0]] for point in points]
+
+    #extracting channels
+    b_values = [color[0] for color in colors]
+    g_values = [color[1] for color in colors]
+    r_values = [color[2] for color in colors]
+
+    #extracting channels true colors
+    b_true_values = [true_color[0] for true_color in true_colors]
+    g_true_values = [true_color[1] for true_color in true_colors]
+    r_true_values = [true_color[2] for true_color in true_colors]
+
+    res_b = splines.CatmullRom((0,*b_true_values,255), (0,*b_values,255))
+    res_g = splines.CatmullRom((0,*g_true_values,255), (0,*g_values,255))
+    res_r = splines.CatmullRom((0,*r_true_values,255), (0,*r_values,255))
+
+    # Make LUT (Lookup Table) from spline
+    LUT_b = np.uint8(res_b.evaluate(range(0,256)))
+    LUT_g = np.uint8(res_g.evaluate(range(0,256)))
+    LUT_r = np.uint8(res_r.evaluate(range(0,256)))
+
+    LUT = np.dstack((LUT_b, LUT_g, LUT_r))
+
+    return cv2.LUT(image, LUT)
+
 def main():
     # Load the image
     img = cv2.imread("./corrupted.png")
@@ -71,34 +107,51 @@ def main():
         sys.exit("Could not detect tearing line in the image.")
 
     # Split the image at the detected tear line
-    top_half, bottom_half = split_image(img, tear_line)
+    top_half, bottom_half = split_image_and_reverse(img, tear_line)
     if top_half is None or bottom_half is None:
         sys.exit("Image splitting failed.")
 
+    matched = exposure.match_histograms(top_half, bottom_half, channel_axis=-1)
+
     # Define true color references and reference points
-    true_color1 = np.array([250, 158,  3], dtype=float) #point1
-    true_color2 = np.array([40, 195, 240], dtype=float) #point2
-    
-    point1 = (128, 541)
-    point2 = (564, 267)
+    true_colors = ((250, 158,  3),(40, 195, 240))
 
-    shifted_image = np.vstack((top_half, bottom_half))
+    points = ((128, 541),(564, 267))
 
-    cv2.imshow("Shifted image", shifted_image)
-    pointed_image = cv2.line(shifted_image, point1, point1, true_color1, 10)
-    pointed_image = cv2.line(pointed_image, point2, point2, true_color2, 5)
-    cv2.imshow("Points",pointed_image)
+    shifted_image = np.vstack((matched, bottom_half))
+    shifted_image = normalize_image(shifted_image, 200, 50)
 
+    #corrected_image = apply_color_correction(shifted_image, true_colors[0], points[0])
+
+    normalized_image = normalize_image(shifted_image, 200, 50)
+    cv2.imshow("Shifted & Normalized image", normalized_image)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
-    corrected_top = apply_color_correction(top_half, true_color2, point2)
-    corrected_bottom = apply_color_correction(bottom_half, true_color1, point1)
-    cv2.imshow("Shifted Image", pointed_image)
-    cv2.imshow("Corrected Image", np.vstack((corrected_top, corrected_bottom)))
+    hsv = cv2.cvtColor(normalized_image, cv2.COLOR_BGR2HSV)
 
+    lower_orange = np.array([10, 100, 20])
+    upper_orange = np.array([25, 255, 255])
+
+    # Create mask
+    mask = cv2.inRange(hsv, lower_orange, upper_orange)
+
+    # Use Canny edge detection
+    edges = cv2.Canny(mask, 50, 150)
+
+    # Find contours
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Detect shapes that resemble a cone
+    for contour in contours:
+        approx = cv2.approxPolyDP(contour, 0.02 * cv2.arcLength(contour, True), True)
+        if len(approx) == 3:  # Triangle approximation
+            cv2.drawContours(normalized_image, [approx], 0, (0, 255, 0), 5)
+
+    # Show the result
+    cv2.imshow('Cone Detection', normalized_image)
     cv2.waitKey(0)
-    cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
